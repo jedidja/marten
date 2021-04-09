@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Baseline;
@@ -11,6 +10,7 @@ using Marten.Events.Daemon.Progress;
 using Marten.Events.Daemon.Resiliency;
 using Marten.Events.Projections;
 using Marten.Exceptions;
+using Marten.Services;
 using Microsoft.Extensions.Logging;
 
 namespace Marten.Events.Daemon
@@ -21,18 +21,17 @@ namespace Marten.Events.Daemon
     internal class ProjectionDaemon: IProjectionDaemon
     {
         private readonly Dictionary<string, ShardAgent> _agents = new();
-        private readonly CancellationTokenSource _cancellation;
+        private CancellationTokenSource _cancellation;
         private readonly HighWaterAgent _highWater;
         private readonly ILogger _logger;
         private readonly DocumentStore _store;
-        private bool _hasStarted;
+        private INodeCoordinator _coordinator;
 
-        public ProjectionDaemon(DocumentStore store, ILogger logger)
+        public ProjectionDaemon(DocumentStore store, IHighWaterDetector detector, ILogger logger)
         {
             _cancellation = new CancellationTokenSource();
             _store = store;
             _logger = logger;
-            var detector = new HighWaterDetector(store.Tenancy.Default, store.Events);
 
             Tracker = new ShardStateTracker(logger);
             _highWater = new HighWaterAgent(detector, Tracker, logger, store.Events.Daemon, _cancellation.Token);
@@ -40,20 +39,71 @@ namespace Marten.Events.Daemon
             Settings = store.Events.Daemon;
         }
 
+        public ProjectionDaemon(DocumentStore store, ILogger logger) : this(store, new HighWaterDetector(new AutoOpenSingleQueryRunner(store.Tenancy.Default), store.Events), logger)
+        {
+        }
+
+        public Task UseCoordinator(INodeCoordinator coordinator)
+        {
+            _coordinator = coordinator;
+            return _coordinator.Start(this, _cancellation.Token);
+        }
+
         public DaemonSettings Settings { get; }
 
         public ShardStateTracker Tracker { get; }
+
+        public bool IsRunning => _highWater.IsRunning;
 
         public async Task StartDaemon()
         {
             _store.Tenancy.Default.EnsureStorageExists(typeof(IEvent));
             await _highWater.Start();
-            _hasStarted = true;
         }
 
-        public async Task StartAll()
+        public Task WaitForNonStaleData(TimeSpan timeout)
         {
-            if (!_hasStarted) await StartDaemon();
+            var completion = new TaskCompletionSource<bool>();
+            var timeoutCancellation = new CancellationTokenSource(timeout);
+
+
+            Task.Run(async () =>
+            {
+                var statistics = await _store.Advanced.FetchEventStoreStatistics(timeoutCancellation.Token);
+                timeoutCancellation.Token.Register(() =>
+                {
+                    completion.TrySetException(new TimeoutException(
+                        $"The active projection shards did not reach sequence {statistics.EventSequenceNumber} in time"));
+                });
+
+                if (CurrentShards().All(x => x.Position >= statistics.EventSequenceNumber))
+                {
+                    completion.SetResult(true);
+                    return;
+                }
+
+                while (!timeoutCancellation.IsCancellationRequested)
+                {
+                    await Task.Delay(100.Milliseconds(), timeoutCancellation.Token);
+
+                    if (CurrentShards().All(x => x.Position >= statistics.EventSequenceNumber))
+                    {
+                        completion.SetResult(true);
+                        return;
+                    }
+                }
+            }, timeoutCancellation.Token);
+
+            return completion.Task;
+
+        }
+
+        public async Task StartAllShards()
+        {
+            if (!_highWater.IsRunning)
+            {
+                await StartDaemon();
+            }
 
             var shards = _store.Events.Projections.AllShards();
             foreach (var shard in shards) await StartShard(shard, CancellationToken.None);
@@ -61,6 +111,11 @@ namespace Marten.Events.Daemon
 
         public async Task StartShard(string shardName, CancellationToken token)
         {
+            if (!_highWater.IsRunning)
+            {
+                await StartDaemon();
+            }
+
             // Latch it so it doesn't double start
             if (_agents.ContainsKey(shardName)) return;
 
@@ -69,8 +124,6 @@ namespace Marten.Events.Daemon
 
         public async Task StartShard(AsyncProjectionShard shard, CancellationToken cancellationToken)
         {
-            if (!_hasStarted) await StartDaemon();
-
             // Don't duplicate the shard
             if (_agents.ContainsKey(shard.Name.Identity)) return;
 
@@ -129,9 +182,25 @@ namespace Marten.Events.Daemon
             }
         }
 
+        private bool _isStopping = false;
+
         public async Task StopAll()
         {
+            // This avoids issues around whether it was signaled here
+            // first or through the coordinator first
+            if (_isStopping) return;
+            _isStopping = true;
+
+            if (_coordinator != null)
+            {
+                await _coordinator.Stop();
+            }
+
+            _cancellation.Cancel();
+            await _highWater.Stop();
+
             foreach (var agent in _agents.Values)
+            {
                 try
                 {
                     if (agent.IsStopping()) continue;
@@ -142,12 +211,18 @@ namespace Marten.Events.Daemon
                 {
                     _logger.LogError(e, "Error trying to stop shard '{ShardName}'", agent.ShardName.Identity);
                 }
+            }
 
             _agents.Clear();
+
+            // Need to restart this so that the daemon could
+            // be restarted later
+            _cancellation = new CancellationTokenSource();
         }
 
         public void Dispose()
         {
+            _coordinator?.Dispose();
             Tracker?.As<IDisposable>().Dispose();
             _cancellation?.Dispose();
             _highWater?.Dispose();

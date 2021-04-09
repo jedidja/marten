@@ -1,5 +1,6 @@
 using System;
 using Marten.Events.Daemon;
+using Marten.Events.Daemon.HighWater;
 using Marten.Events.Daemon.Resiliency;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -33,9 +34,25 @@ namespace Marten
         /// <returns></returns>
         public static MartenConfigurationExpression AddMarten(this IServiceCollection services, StoreOptions options)
         {
+            services.AddMarten(s => options);
+            return new MartenConfigurationExpression(services, options);
+        }
+
+        /// <summary>
+        /// Add Marten IDocumentStore, IDocumentSession, and IQuerySession service registrations
+        /// to your application by configuring a StoreOptions using services in your DI container
+        /// </summary>
+        /// <param name="services"></param>
+        /// <param name="options">The Marten configuration for this application</param>
+        /// <returns></returns>
+        public static MartenConfigurationExpression AddMarten(this IServiceCollection services, Func<IServiceProvider, StoreOptions> optionSource)
+        {
+            services.AddSingleton<StoreOptions>(optionSource);
+
             services.AddSingleton<IDocumentStore>(s =>
             {
                 var logger = s.GetService<ILogger<IDocumentStore>>() ?? new NullLogger<IDocumentStore>();
+                var options = s.GetRequiredService<StoreOptions>();
                 options.Logger(new DefaultMartenLogger(logger));
 
                 return new DocumentStore(options);
@@ -48,31 +65,9 @@ namespace Marten
             services.AddScoped(s => s.GetRequiredService<ISessionFactory>().QuerySession());
             services.AddScoped(s => s.GetRequiredService<ISessionFactory>().OpenSession());
 
-            switch (options.Events.Daemon.Mode)
-            {
-                case DaemonMode.Disabled:
-                    // Nothing
-                    break;
+            services.AddHostedService<AsyncProjectionHostedService>();
 
-                case DaemonMode.Solo:
-                    services.AddSingleton<INodeCoordinator, SoloCoordinator>();
-                    services.AddSingleton(x=>
-                        x.GetRequiredService<IDocumentStore>()
-                            .BuildProjectionDaemon(x.GetRequiredService<ILogger<IProjectionDaemon>>()));
-                    services.AddHostedService<AsyncProjectionHostedService>();
-                    break;
-
-                case DaemonMode.HotCold:
-                    services.AddSingleton<INodeCoordinator, HotColdCoordinator>();
-                    services.AddSingleton(x =>
-                        x.GetRequiredService<IDocumentStore>()
-                            .BuildProjectionDaemon(x.GetRequiredService<ILogger<IProjectionDaemon>>()));
-                    services.AddHostedService<AsyncProjectionHostedService>();
-                    break;
-
-            }
-
-            return new MartenConfigurationExpression(services, options);
+            return new MartenConfigurationExpression(services, null);
         }
 
         /// <summary>
@@ -136,6 +131,10 @@ namespace Marten
             /// <returns></returns>
             public IDocumentStore InitializeStore()
             {
+                if (_options == null)
+                    throw new InvalidOperationException(
+                        "This operation is not valid when the StoreOptions is built by Func<IServiceProvider, StoreOptions>");
+
                 var store = new DocumentStore(_options);
                 _services.AddSingleton<IDocumentStore>(store);
 

@@ -14,12 +14,17 @@ namespace Marten.Events.Daemon
         public Task Start(IProjectionDaemon agent, CancellationToken token)
         {
             _agent = agent;
-            return agent.StartAll();
+            return agent.StartAllShards();
         }
 
         public Task Stop()
         {
             return _agent.StopAll();
+        }
+
+        public void Dispose()
+        {
+            // Nothing
         }
     }
 }
