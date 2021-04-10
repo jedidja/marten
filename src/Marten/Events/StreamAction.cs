@@ -6,7 +6,7 @@ using Marten.Exceptions;
 using Marten.Internal;
 using Marten.Schema.Identity;
 using Marten.Storage;
-
+#nullable enable
 namespace Marten.Events
 {
     public enum StreamActionType
@@ -39,7 +39,7 @@ namespace Marten.Events
         /// The identity of this stream if using strings as the stream
         /// identity
         /// </summary>
-        public string Key { get; }
+        public string? Key { get; }
 
         /// <summary>
         /// Is this action the start of a new stream or appending
@@ -51,22 +51,22 @@ namespace Marten.Events
         /// If the stream was started as tagged to an aggregate type, that will
         /// be reflected in this property. May be null
         /// </summary>
-        public Type AggregateType { get; internal set; }
+        public Type? AggregateType { get; internal set; }
 
         /// <summary>
         /// Marten's name for the aggregate type that will be persisted
         /// to the streams table
         /// </summary>
-        public string AggregateTypeName { get; internal set; }
+        public string? AggregateTypeName { get; internal set; }
 
         /// <summary>
         /// The Id of the current tenant
         /// </summary>
-        public string TenantId { get; internal set; }
+        public string? TenantId { get; internal set; }
 
 
 
-        private readonly List<IEvent> _events = new List<IEvent>();
+        private readonly List<IEvent> _events = new();
 
         private StreamAction(Guid stream, StreamActionType actionType)
         {
@@ -247,7 +247,7 @@ namespace Marten.Events
                 {
                     if (currentVersion != ExpectedVersionOnServer.Value)
                     {
-                        throw new EventStreamUnexpectedMaxEventIdException((object) Key ?? Id, AggregateType, ExpectedVersionOnServer.Value, currentVersion);
+                        throw new EventStreamUnexpectedMaxEventIdException((object?) Key ?? Id, AggregateType, ExpectedVersionOnServer.Value, currentVersion);
                     }
                 }
 
@@ -264,6 +264,8 @@ namespace Marten.Events
                 @event.Sequence = sequences.Dequeue();
                 @event.TenantId ??= session.Tenant.TenantId;
                 @event.Timestamp = timestamp;
+
+                ProcessMetadata(@event, graph, session);
             }
 
             Version = Events.Last().Version;
@@ -291,6 +293,26 @@ namespace Marten.Events
             {
 
             };
+        }
+
+        private static void ProcessMetadata(IEvent @event, EventGraph graph, IMartenSession session)
+        {
+            if (graph.Metadata.CausationId.Enabled)
+            {
+                @event.CausationId ??= session.CausationId;
+            }
+
+            if (graph.Metadata.CorrelationId.Enabled)
+            {
+                @event.CorrelationId = session.CorrelationId;
+            }
+
+            if (!graph.Metadata.Headers.Enabled) return;
+            if (!(session.Headers?.Count > 0)) return;
+            foreach (var header in session.Headers)
+            {
+                @event.SetHeader(header.Key, header.Value);
+            }
         }
 
         public static StreamAction For(Guid streamId, IReadOnlyList<IEvent> events)
